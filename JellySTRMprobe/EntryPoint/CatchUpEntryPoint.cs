@@ -22,7 +22,7 @@ public class CatchUpEntryPoint : IHostedService, IDisposable
     private readonly ILibraryManager _libraryManager;
     private readonly IProbeService _probeService;
     private readonly ILogger<CatchUpEntryPoint> _logger;
-    private readonly ConcurrentQueue<BaseItem> _pendingItems = new();
+    private readonly ConcurrentQueue<Guid> _pendingItemIds = new();
 
     private CancellationTokenSource? _stoppingCts;
     private Timer? _debounceTimer;
@@ -83,7 +83,7 @@ public class CatchUpEntryPoint : IHostedService, IDisposable
             return;
         }
 
-        _pendingItems.Enqueue(item);
+        _pendingItemIds.Enqueue(item.Id);
         _debounceTimer?.Change(DebounceDelay, Timeout.InfiniteTimeSpan);
     }
 
@@ -105,38 +105,71 @@ public class CatchUpEntryPoint : IHostedService, IDisposable
         }
     }
 
-    private async Task ProcessQueueAsync()
+    internal async Task ProcessQueueAsync()
     {
-        var items = new List<BaseItem>();
+        var queuedItemIds = new HashSet<Guid>();
 
-        while (_pendingItems.TryDequeue(out var item))
+        while (_pendingItemIds.TryDequeue(out var itemId))
         {
-            items.Add(item);
+            queuedItemIds.Add(itemId);
         }
 
-        if (items.Count == 0)
+        if (queuedItemIds.Count == 0)
         {
             return;
         }
 
-        // Filter out items that already have video/audio streams (subtitle-only still needs probing)
-        var unprobed = items
-            .Where(item => _probeService.IsUnprobed(item))
-            .ToList();
+        var config = Plugin.Instance.Configuration;
+        config.Validate();
+
+        var token = _stoppingCts?.Token ?? CancellationToken.None;
+        token.ThrowIfCancellationRequested();
+
+        IEnumerable<Guid> itemIds = queuedItemIds;
+        if (config.SelectedLibraryIds.Length > 0)
+        {
+            var query = new InternalItemsQuery
+            {
+                ItemIds = queuedItemIds.ToArray(),
+                AncestorIds = config.SelectedLibraryIds,
+            };
+
+            itemIds = _libraryManager.GetItemIds(query);
+        }
+
+        // ItemAdded can fire before a scan finishes populating hierarchy. Resolve the
+        // current repository object after the debounce instead of persisting that stale instance.
+        var unprobed = new List<BaseItem>();
+        foreach (var itemId in itemIds)
+        {
+            token.ThrowIfCancellationRequested();
+
+            BaseItem? item;
+            try
+            {
+                item = _libraryManager.GetItemById(itemId);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Catch-up: skipping item {ItemId}: failed to resolve", itemId);
+                continue;
+            }
+
+            if (item is not null && _probeService.IsUnprobed(item))
+            {
+                unprobed.Add(item);
+            }
+        }
 
         if (unprobed.Count == 0)
         {
-            _logger.LogDebug("Catch-up: all {Count} queued items already have video/audio streams", items.Count);
+            _logger.LogDebug("Catch-up: no queued STRM items need probing ({Count} queued)", queuedItemIds.Count);
             return;
         }
 
         _logger.LogInformation("Catch-up: probing {Count} new STRM items", unprobed.Count);
 
-        var config = Plugin.Instance.Configuration;
-        config.Validate();
-
         var progress = new Progress<double>();
-        var token = _stoppingCts?.Token ?? CancellationToken.None;
 
         var result = await _probeService.ProbeBatchAsync(
             unprobed,
