@@ -153,6 +153,7 @@ public class CatchUpEntryPointTests
 
         act.Should().NotThrow();
     }
+
     [Fact]
     public async Task ProcessQueueAsync_ResolvesCurrentItemBeforeProbing()
     {
@@ -351,5 +352,4 @@ public class CatchUpEntryPointTests
 
         entryPoint.Dispose();
     }
-
 }
